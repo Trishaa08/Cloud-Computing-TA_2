@@ -1,0 +1,341 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cloud Computing TA2 - Event Driven Serverless File Processing Architecture
+
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive SNS file processing notifications
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: Enter a valid email address
+
+
+Resources:
+
+  TA2VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: TA2-VPC
+
+  TA2PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TA2VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: TA2-Public-Subnet
+
+  TA2PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TA2VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: TA2-Private-Subnet
+
+  
+  TA2InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: TA2-Internet-Gateway
+
+  TA2GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref TA2VPC
+      InternetGatewayId: !Ref TA2InternetGateway
+
+  
+  TA2PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TA2VPC
+      Tags:
+        - Key: Name
+          Value: TA2-Public-Route-Table
+
+  TA2PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: TA2GatewayAttachment
+    Properties:
+      RouteTableId: !Ref TA2PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref TA2InternetGateway
+
+  TA2PublicSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TA2PublicSubnet
+      RouteTableId: !Ref TA2PublicRouteTable
+
+  
+  TA2NatElasticIP:
+    Type: AWS::EC2::EIP
+    DependsOn: TA2GatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: TA2-NAT-Elastic-IP
+
+  TA2NatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: TA2PublicRoute
+    Properties:
+      AllocationId: !GetAtt TA2NatElasticIP.AllocationId
+      SubnetId: !Ref TA2PublicSubnet
+      ConnectivityType: public
+      Tags:
+        - Key: Name
+          Value: TA2-NAT-Gateway
+
+  TA2PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TA2VPC
+      Tags:
+        - Key: Name
+          Value: TA2-Private-Route-Table
+
+  TA2PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref TA2PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref TA2NatGateway
+
+  TA2PrivateSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TA2PrivateSubnet
+      RouteTableId: !Ref TA2PrivateRouteTable
+
+
+  
+  TA2S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:TA2-File-Processor'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+
+      Tags:
+        - Key: Name
+          Value: TA2-File-Processing-Bucket
+
+
+    
+  TA2SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: FileProcessingAlerts
+      DisplayName: TA2 File Processing Alerts
+      Tags:
+        - Key: Name
+          Value: TA2-File-Processing-SNS
+
+  TA2SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref TA2SNSTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+
+
+  TA2LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Execution role for TA2 S3 file processing Lambda
+
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+      Policies:
+        - PolicyName: TA2S3AndSNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadUploadedFiles
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${TA2S3Bucket.Arn}/uploads/*'
+
+              - Sid: WriteProcessedMetadata
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${TA2S3Bucket.Arn}/processed/*'
+
+              - Sid: PublishSNSNotifications
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref TA2SNSTopic
+
+      Tags:
+        - Key: Name
+          Value: TA2-Lambda-Execution-Role
+
+  TA2LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for TA2 Lambda function
+      VpcId: !Ref TA2VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: TA2-Lambda-Security-Group
+
+
+  
+  TA2LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TA2-File-Processor
+      Description: Processes uploaded S3 files and sends SNS alerts
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt TA2LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref TA2LambdaSecurityGroup
+        SubnetIds:
+          - !Ref TA2PrivateSubnet
+
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref TA2SNSTopic
+
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from datetime import datetime, timezone
+          from urllib.parse import unquote_plus
+
+          s3 = boto3.client("s3")
+          sns = boto3.client("sns")
+
+          def lambda_handler(event, context):
+              results = []
+
+              for record in event["Records"]:
+                  bucket = record["s3"]["bucket"]["name"]
+                  key = unquote_plus(record["s3"]["object"]["key"])
+
+                  if not key.startswith("uploads/"):
+                      continue
+
+                  response = s3.get_object(
+                      Bucket=bucket,
+                      Key=key
+                  )
+
+                  file_size = response["ContentLength"]
+                  response["Body"].read(1024)
+                  response["Body"].close()
+
+                  metadata = {
+                      "bucket": bucket,
+                      "file_name": key,
+                      "file_size_bytes": file_size,
+                      "status": "Processed Successfully",
+                      "processed_at": datetime.now(
+                          timezone.utc
+                      ).isoformat()
+                  }
+
+                  output_key = "processed/" + key[len("uploads/"):] + ".json"
+
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=output_key,
+                      Body=json.dumps(metadata, indent=2),
+                      ContentType="application/json"
+                  )
+
+                  message = (
+                      "File Processing Successful\n\n"
+                      f"Bucket: {bucket}\n"
+                      f"File: {key}\n"
+                      f"Size: {file_size} bytes\n"
+                      f"Metadata saved at: {output_key}\n"
+                      "Status: Processed Successfully"
+                  )
+
+                  sns.publish(
+                      TopicArn=os.environ["SNS_TOPIC_ARN"],
+                      Subject="TA2 File Processing Successful",
+                      Message=message
+                  )
+
+                  print(json.dumps(metadata))
+                  results.append(metadata)
+
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps(results)
+              }
+
+      Tags:
+        - Key: Name
+          Value: TA2-File-Processor
+
+  
+  TA2LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TA2LambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt TA2S3Bucket.Arn

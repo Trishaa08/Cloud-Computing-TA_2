@@ -1,0 +1,6 @@
+Cloud Computing TA-2
+Event Driven Serverless File Processing
+
+This is a test file uploaded to Amazon S3.
+AWS Lambda should process this file.
+Amazon SNS should send an email notification.
